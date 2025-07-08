@@ -14,20 +14,6 @@ import logging
 import torch.distributed as dist
 from transformers.models.qwen2_vl.modeling_qwen2_vl import Qwen2VLDecoderLayer, Qwen2VLVisionBlock
 from torch.distributed import init_process_group, destroy_process_group
-from torch.distributed.checkpoint.state_dict import (
-    StateDictOptions,
-    get_model_state_dict,
-    get_optimizer_state_dict,
-    set_model_state_dict,
-    set_optimizer_state_dict,
-)
-import subprocess
-from transformers.models.qwen2_vl.modeling_qwen2_vl import rotate_half
-
-
-from torch.distributed.algorithms._checkpoint.checkpoint_wrapper import (
-    apply_activation_checkpointing, checkpoint_wrapper, CheckpointImpl,
-)
 
 # transformer engine
 import transformer_engine.pytorch as te
@@ -40,6 +26,7 @@ if FP8_ENABLED:
     print(f"FP8 enabled!!!")
 else:
     print(f"FP8 NOT enabled! use bf16!")
+IMAGE_REPEAT = 28
 
 # Set up logging
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
@@ -59,6 +46,7 @@ torch.cuda.set_device(device)
 # revision = "895c3a49bc3fa70a340399125c650a463535e71c"
 model_name = "Qwen/Qwen2-VL-7B-Instruct"
 revision = "a28a094eb66a9f2ac70eef346f040d8a79977472"
+# model_name = "Qwen/Qwen2.5-VL-7B-Instruct
 # model_name = "Qwen/Qwen2-VL-72B-Instruct"
 # revision = "f9b556a74d58e6d9915f73227c21045c87342b42"
 
@@ -71,7 +59,7 @@ processor = Qwen2VLProcessor.from_pretrained(
 class Config:
     dataset_id = dataset_id
     output_dir = "/tmp_ckpt"
-    batch_size = 16
+    batch_size = 1
     num_epochs = 1
     max_steps = 32
     learning_rate = 5e-6
@@ -87,7 +75,6 @@ system_message = (
     "from chart images. Answer concisely."
 )
 def format_data(sample):
-
     return [
         {
             "role": "system",
@@ -95,16 +82,15 @@ def format_data(sample):
         },
         {
             "role": "user",
-            "content": [
-                {
-                    "type": "image",
-                    "image": sample["image"],
-                },
-                {
-                    "type": "text",
-                    "text": sample["query"],
-                },
-            ],
+            "content": (
+                [{"type": "image", "image": sample["image"]} for i in range(IMAGE_REPEAT)]
+                + [
+                    {
+                        "type": "text",
+                        "text": sample["query"],
+                    }
+                ]
+            ),
         },
         {
             "role": "assistant",
@@ -114,18 +100,19 @@ def format_data(sample):
 
 def pad_text(inputs, labels):
     # JQ:
+    # input shape can be [1, 3195]
     if DEBUG:
-        print(f"input shape: {inputs['input_ids'].shape} labels shape: {labels.shape}"
-          f", attn mask: {inputs['attention_mask'].shape}"
-          f", pixel_values: {inputs['pixel_values'].shape}"
+        print(f"input shape: {list(inputs['input_ids'].shape)}"
+          f", pixel_values: {list(inputs['pixel_values'].shape)}"
           f", image_grid_thw: {inputs['image_grid_thw'].shape}")
 
     to_pad = int(8 - inputs['input_ids'].shape[1] % 8)
-    p2d = (to_pad, 0) # Pad only the last dim, to the left, otherwise cause error
+    if FP8_ENABLED and (to_pad > 0):
+      p2d = (to_pad, 0) # Pad only the last dim, to the left, otherwise cause error
 
-    inputs['input_ids'] = F.pad(inputs['input_ids'], p2d, "constant", 0)
-    inputs['attention_mask'] = F.pad(inputs['attention_mask'], p2d, "constant", 0)
-    labels = F.pad(labels, p2d, "constant", 0)
+      inputs['input_ids'] = F.pad(inputs['input_ids'], p2d, "constant", 0)
+      inputs['attention_mask'] = F.pad(inputs['attention_mask'], p2d, "constant", 0)
+      labels = F.pad(labels, p2d, "constant", 0)
 
     return inputs, labels
 
@@ -149,7 +136,7 @@ def train_model(model, train_loader, optimizer, config, fp8_recipe):
 
     with torch.profiler.profile(
         schedule=torch.profiler.schedule(wait=1, warmup=4, active=3, repeat=10),
-        on_trace_ready=torch.profiler.tensorboard_trace_handler('./prof/7b-fp8-prefetch'),
+        on_trace_ready=torch.profiler.tensorboard_trace_handler('./prof/'),
         record_shapes=True,
         profile_memory=True,
         with_stack=False

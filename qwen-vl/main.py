@@ -66,7 +66,7 @@ class Config:
     batch_size = 1
     num_epochs = 1
     max_steps = 32
-    learning_rate = 0e-6  # 5e-6
+    learning_rate = 5e-6  # 5e-6
     max_seq_length = 512
     # JQ: is LoRA used?
     lora_rank = 32
@@ -109,15 +109,17 @@ def get_padding_size(length):
     return to_pad
 
 
-def pad_text(inputs, labels):
+def pad_text(inputs, labels, pad_token_id):
+    if pad_token_id is None:
+        pad_token_id = 0
     old_length = inputs['input_ids'].shape[1]
     to_pad = get_padding_size(old_length)
     if FP8_ENABLED and (to_pad > 0):
-      p2d = (to_pad, 0) # Pad only the last dim, to the left, otherwise cause error
-
-      inputs['input_ids'] = F.pad(inputs['input_ids'], p2d, "constant", 0)
+      p2d = (to_pad, 0)  # Pad only the last dim, to the left, required by flash attn 2
+      inputs['input_ids'] = F.pad(inputs['input_ids'], p2d, "constant", pad_token_id)
       inputs['attention_mask'] = F.pad(inputs['attention_mask'], p2d, "constant", 0)
-      labels = F.pad(labels, p2d, "constant", 0)
+      labels = F.pad(labels, p2d, "constant", -100)
+
       if DEBUG:
         print(f"Pad text from {old_length} to {inputs['input_ids'].shape[1]}")
 
@@ -164,11 +166,7 @@ def train_model(model, train_loader, optimizer, config, fp8_recipe):
         inputs = inputs.to(config.device)
         labels = labels.to(config.device)
 
-        # DEBUG
-        id_shape = inputs["input_ids"].shape
-        print(f"Step: {step}, input ids shape: {list(id_shape)}")
-
-        inputs, labels = pad_text(inputs, labels)
+        inputs, labels = pad_text(inputs, labels, model.config.get_text_config().pad_token_id)
         inputs = pad_image(inputs)
 
         with te.fp8_autocast(enabled=FP8_ENABLED, fp8_recipe=fp8_recipe):
@@ -293,7 +291,7 @@ def main():
         suffix = "_bf16"
     run = wandb.init(
         project="qwen2-vl",
-        name=model_name+suffix,
+        name=model_name+f"_lr{config.learning_rate}"+suffix,
         config=config,
     )
 
@@ -308,12 +306,10 @@ def main():
     model = model.to(torch.bfloat16).cuda()
     optimizer = torch.optim.AdamW(model.parameters(), lr=config.learning_rate)
 
-    # NV: only apply fp8 on LM for now
+    # NV: apply fp8
     _to_te(model.language_model)
-    # _to_te(model.visual)
-    # TODO: print named modules
-    # exit()
-
+    if TE_VIS:
+      _to_te(model.visual)
 
     # Load dataset
     logger.info("Loading dataset...")

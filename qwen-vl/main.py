@@ -1,10 +1,12 @@
 # te_qwen2_vl.py
 import os
+import re
+import wandb
+
 import torch
 import torch.nn as nn
-from torch.nn import Module
 from torch.utils.data import Dataset, DataLoader
-from transformers import Qwen2VLForConditionalGeneration, Qwen2VLProcessor, AutoModelForVision2Seq, AutoConfig
+from transformers import Qwen2VLForConditionalGeneration, Qwen2VLProcessor, AutoConfig
 import torch.nn.functional as F
 
 from qwen_vl_utils import process_vision_info
@@ -12,14 +14,14 @@ from datasets import load_dataset
 import logging
 
 import torch.distributed as dist
-from transformers.models.qwen2_vl.modeling_qwen2_vl import Qwen2VLDecoderLayer, Qwen2VLVisionBlock
 from torch.distributed import init_process_group, destroy_process_group
 
 # transformer engine
 import transformer_engine.pytorch as te
-from transformer_engine.common.recipe import Format, DelayedScaling
 from transformer_engine.common import recipe
 
+
+# JQ: config
 DEBUG = (int(os.getenv("DEBUG", 0)) > 0)
 FP8_ENABLED = (int(os.getenv("FP8", 0)) > 0)
 if FP8_ENABLED:
@@ -27,6 +29,8 @@ if FP8_ENABLED:
 else:
     print(f"FP8 NOT enabled! use bf16!")
 IMAGE_REPEAT = 28
+RECIPE = "block"
+TE_VIS = False
 
 # Set up logging
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
@@ -42,10 +46,10 @@ device = torch.device(f"cuda:{local_rank}")
 torch.cuda.set_device(device)
 
 
-# model_name = "Qwen/Qwen2-VL-2B-Instruct"
-# revision = "895c3a49bc3fa70a340399125c650a463535e71c"
-model_name = "Qwen/Qwen2-VL-7B-Instruct"
-revision = "a28a094eb66a9f2ac70eef346f040d8a79977472"
+model_name = "Qwen/Qwen2-VL-2B-Instruct"
+revision = "895c3a49bc3fa70a340399125c650a463535e71c"
+# model_name = "Qwen/Qwen2-VL-7B-Instruct"
+# revision = "a28a094eb66a9f2ac70eef346f040d8a79977472"
 # model_name = "Qwen/Qwen2.5-VL-7B-Instruct
 # model_name = "Qwen/Qwen2-VL-72B-Instruct"
 # revision = "f9b556a74d58e6d9915f73227c21045c87342b42"
@@ -62,7 +66,7 @@ class Config:
     batch_size = 1
     num_epochs = 1
     max_steps = 32
-    learning_rate = 5e-6
+    learning_rate = 0e-6  # 5e-6
     max_seq_length = 512
     # JQ: is LoRA used?
     lora_rank = 32
@@ -98,28 +102,41 @@ def format_data(sample):
         },
     ]
 
-def pad_text(inputs, labels):
-    # JQ:
-    # input shape can be [1, 3195]
-    if DEBUG:
-        print(f"input shape: {list(inputs['input_ids'].shape)}"
-          f", pixel_values: {list(inputs['pixel_values'].shape)}"
-          f", image_grid_thw: {inputs['image_grid_thw'].shape}")
 
-    to_pad = int(8 - inputs['input_ids'].shape[1] % 8)
+def get_padding_size(length):
+    required_multiple = 16
+    to_pad = int(required_multiple - length % required_multiple) % required_multiple
+    return to_pad
+
+
+def pad_text(inputs, labels):
+    old_length = inputs['input_ids'].shape[1]
+    to_pad = get_padding_size(old_length)
     if FP8_ENABLED and (to_pad > 0):
       p2d = (to_pad, 0) # Pad only the last dim, to the left, otherwise cause error
 
       inputs['input_ids'] = F.pad(inputs['input_ids'], p2d, "constant", 0)
       inputs['attention_mask'] = F.pad(inputs['attention_mask'], p2d, "constant", 0)
       labels = F.pad(labels, p2d, "constant", 0)
+      if DEBUG:
+        print(f"Pad text from {old_length} to {inputs['input_ids'].shape[1]}")
 
     return inputs, labels
 
 
-def pad_image():
+def pad_image(inputs):
+    if DEBUG:
+        print(f"Pixel values shape: {list(inputs['pixel_values'].shape)}")  # [S, 1176]
+        # print(f"Grid THW: {inputs['image_grid_thw']}")  # [images, 3], S = sum(T*H*W of all images)
+
     # NV: pad image, not used for now
-    to_pad = int(8 - (inputs['pixel_values'].shape[0] / 4) % 8) * 4
+    seq_len = inputs['pixel_values'].shape[0]
+    required_multiple = 16
+    to_pad = int(16 - inputs['pixel_values'].shape[0] % 16) % 16
+    if FP8_ENABLED:
+        assert to_pad == 0, "Padding is required for FP8, but not implemented!"
+    return inputs
+
     if False:
         p2d = (0, 0, 0, to_pad)
         import torch.nn.functional as F
@@ -136,7 +153,7 @@ def train_model(model, train_loader, optimizer, config, fp8_recipe):
 
     with torch.profiler.profile(
         schedule=torch.profiler.schedule(wait=1, warmup=4, active=3, repeat=10),
-        on_trace_ready=torch.profiler.tensorboard_trace_handler('./prof/'),
+        # on_trace_ready=torch.profiler.tensorboard_trace_handler('./prof/test/'),
         record_shapes=True,
         profile_memory=True,
         with_stack=False
@@ -147,14 +164,12 @@ def train_model(model, train_loader, optimizer, config, fp8_recipe):
         inputs = inputs.to(config.device)
         labels = labels.to(config.device)
 
-        inputs, labels = pad_text(inputs, labels)
+        # DEBUG
+        id_shape = inputs["input_ids"].shape
+        print(f"Step: {step}, input ids shape: {list(id_shape)}")
 
-        # dict_keys(['input_ids', 'attention_mask', 'pixel_values', 'image_grid_thw'])
-        # print all shape of inputs
-        # input_ids shape: torch.Size([1, 171])
-        # attention_mask shape: torch.Size([1, 171])
-        # pixel_values shape: torch.Size([440, 1176])
-        # image_grid_thw shape: torch.Size([1, 3])
+        inputs, labels = pad_text(inputs, labels)
+        inputs = pad_image(inputs)
 
         with te.fp8_autocast(enabled=FP8_ENABLED, fp8_recipe=fp8_recipe):
             outputs = model(**inputs, labels=labels)
@@ -164,6 +179,7 @@ def train_model(model, train_loader, optimizer, config, fp8_recipe):
         optimizer.step()
         optimizer.zero_grad()
 
+        # print(torch.cuda.memory_stats())
         prof.step()   # torch profiler
 
         step += 1
@@ -172,7 +188,8 @@ def train_model(model, train_loader, optimizer, config, fp8_recipe):
             break
 
         epoch = 0
-        print(f"Epoch {epoch+1}/{config.num_epochs}, Step {step}/{total_steps}, Loss: {loss.item():.4f}")
+        print(f"Epoch {epoch+1}/{config.num_epochs}, Step {step}/{total_steps}, Loss: {loss.detach().item():.4f}")
+        wandb.log({"loss": loss})
         del loss
 
 
@@ -205,10 +222,30 @@ def collate_fn(examples):
 
     return batch, labels
 
+
 def _to_te(module: nn.Module):
+    def is_fp8_satisfied(child, name):
+        # name_pattern = "qkv|proj"
+        name_pattern = "qkv|proj|fc"
+        if not isinstance(child, nn.Linear):
+            return False
+        if not re.search(name_pattern, name):
+            return False
+        if not (child.in_features % 16 == 0):
+            return False
+        if not (child.out_features % 16 == 0):
+            return False
+        return True
+
     for name, child in list(module.named_children()):
-        # 1) Linear → te.Linear
-        if isinstance(child, nn.Linear) and child.in_features % 16 == 0 and child.out_features % 16 == 0:
+        # DEBUG: select layers
+        if name in ("0", "27"):
+            continue
+
+        # 1) Linear -> te.Linear
+        if is_fp8_satisfied(child, name):
+            if DEBUG:
+                print(f"Use TE linear for module: {name}, w shape: {child.in_features}, {child.out_features}")
             te_linear = te.Linear(
                 child.in_features,
                 child.out_features,
@@ -233,10 +270,32 @@ def _to_te(module: nn.Module):
         else:
             _to_te(child)
 
+def get_recipe():
+    if RECIPE == "block":
+        return recipe.Float8BlockScaling(use_fp32_scales=True)
+    if RECIPE == "delay":
+        return recipe.DelayedScaling(
+            fp8_format=recipe.Format.HYBRID,
+            amax_history_len=128,)
+    assert False, f"fp8 recipe ({RECIPE}) is not set correctly!"
+
+
 # Main function
 def main():
     os.environ["HF_ENDPOINT"] = "https://hf-mirror.com"
     config = Config()
+
+    # WandB
+    wandb.login()
+    if FP8_ENABLED:
+        suffix = f"_fp8_{RECIPE}" + ("_vis" if TE_VIS else "_llm")
+    else:
+        suffix = "_bf16"
+    run = wandb.init(
+        project="qwen2-vl",
+        name=model_name+suffix,
+        config=config,
+    )
 
     # Load model and processor
     logger.info("Loading model and processor...")
@@ -251,28 +310,28 @@ def main():
 
     # NV: only apply fp8 on LM for now
     _to_te(model.language_model)
+    # _to_te(model.visual)
+    # TODO: print named modules
+    # exit()
 
-    # fp8 training recipe
-    fp8_recipe = DelayedScaling(
-        fp8_format=Format.HYBRID,    # E4M3 during forward pass, E5M2 during backward pass
-        # fp8_format=Format.E4M3,    # E4M3 used everywhere
-        amax_history_len=16,
-    )
 
     # Load dataset
     logger.info("Loading dataset...")
-    first_row = load_dataset(
+    train_dataset = load_dataset(
         config.dataset_id,
-        split="train[:10]",
-        )[3]
-    train_dataset = [first_row] * 32 * config.batch_size
+        split=f"train[:{32*config.batch_size}]",
+        ) #[:32]
+
+    # DEBUG: only use 1 sample
+    # train_dataset = [train_dataset[0]] * 32 * config.batch_size
+
     train_dataset = [format_data(sample) for sample in train_dataset]
     train_dataloader = torch.utils.data.DataLoader(
         train_dataset,
         batch_size=config.batch_size,
         collate_fn=collate_fn,
         pin_memory=True,
-        num_workers=4,
+        num_workers=2,
         prefetch_factor=1, #  factor * num_workers batches
         shuffle=False,
     )
@@ -280,7 +339,8 @@ def main():
     # Train
     logger.info("Starting training...")
     torch.cuda.empty_cache()
-    train_model(model, train_dataloader, optimizer, config, fp8_recipe)
+
+    train_model(model, train_dataloader, optimizer, config, get_recipe())
 
 
 if __name__ == "__main__":

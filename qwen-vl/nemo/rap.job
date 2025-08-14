@@ -33,7 +33,7 @@ echo $MOUNT
 WORKDIR=/home/jqi/workspace/work/training-lab/qwen-vl/nemo
 EXE=${WORKDIR}/qwen2vl_finetune.py
 
-# WANDB_API_KEY=f582858453c3052a98764817e4c491ab54a0897e
+# WANDB_API_KEY=
 
 DIR=`pwd`
 DATETIME=`date +'date_%y-%m-%d_time_%H-%M-%S'`

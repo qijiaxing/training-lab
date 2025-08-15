@@ -1,0 +1,73 @@
+#!/bin/bash
+
+#SBATCH -N 1
+#SBATCH -p h20q
+#SBATCH --ntasks-per-node=1
+#SBATCH --gres=gpu:2
+#SBATCH --exclusive
+#SBATCH --mem=0
+#SBATCH -J qwen
+##SBATCH -d singleton
+
+export MASTER_ADDR=(`scontrol show hostnames $SLURM_JOB_NODELIST | head -n 1`)
+# export MASTER_PORT=$((${SLURM_JOB_ID} % 16384 + 49152))
+export MASTER_PORT=65222
+NUM_NODES=$SLURM_JOB_NUM_NODES
+NODE_RANK=$SLURM_NODEID
+
+current_time=$(date +"%Y%m%d_%H%M")
+
+export NCCL_IB_SL=1
+export NCCL_IB_TIMEOUT=19
+export CUDA_DEVICE_MAX_CONNECTIONS=1
+export NVTE_ALLOW_NONDETERMINISTIC_ALGO=0
+export OMP_NUM_THREADS=1
+
+MOUNT='/home/haoyuan/workspace:/home/haoyuan/workspace'
+MOUNT+=',/home/jqi/workspace:/home/jqi/workspace,/lustre/raplab/client/jqi/workspace:/lustre/raplab/client/jqi/workspace,/lustre/raplab/client/xueh/workspace:/lustre/raplab/client/xueh/workspace,/lustre/raplab/client/haoyuan/workspace:/lustre/raplab/client/haoyuan/workspace'
+IMAGE=/lustre/raplab/client/jqi/workspace/nemo.25.07.sqsh
+
+echo Image: $IMAGE
+echo $MOUNT 
+
+WORKDIR=/home/jqi/workspace/work/training-lab/qwen-vl/nemo/test-llm
+EXE=${WORKDIR}/pretraining.py
+
+# WANDB_API_KEY=
+
+DIR=`pwd`
+DATETIME=`date +'date_%y-%m-%d_time_%H-%M-%S'`
+LOGS_DIR=${WORKDIR}/logs
+mkdir -p ${LOGS_DIR}
+
+# GPUS=2
+# TP=1
+# MBS=1
+# GBS=1
+# MAX_SEQ=4096
+FP8="--fp8"  # control fp8 or bf16
+PROFILE_OUT=llama.3B.H20.tp2
+NSYS="nsys profile -s none \
+      -o ${PROFILE_OUT} \
+      -t cuda,nvtx \
+      --force-overwrite true \
+      --capture-range=cudaProfilerApi \
+      --capture-range-end=stop"
+
+run_cmd=" \
+    cd `pwd`; \
+    export MASTER_ADDR=${MASTER_ADDR}; \
+    export MASTER_PORT=${MASTER_PORT}; \
+    export HUGGINGFACE_HUB_CACHE=/root/.cache/huggingface/hub; \
+    export HF_HOME=/home/jqi/workspace/hf_home/hub/; \
+    NVTE=1 NVTE_DEBUG_LEVEL=2 python ${EXE} ${FP8}"
+echo ${run_cmd}
+
+srun -l \
+     --container-image ${IMAGE} \
+     --container-mounts ${MOUNT} \
+     --output=${LOGS_DIR}/llm_job%j_${DATETIME}.log \
+     --container-writable \
+     bash -c "${run_cmd}"
+
+set +x

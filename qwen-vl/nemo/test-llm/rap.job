@@ -6,6 +6,7 @@
 #SBATCH --gres=gpu:2
 #SBATCH --exclusive
 #SBATCH --mem=0
+#SBATCH -t 0:29:00
 #SBATCH -J qwen
 ##SBATCH -d singleton
 
@@ -23,6 +24,7 @@ export CUDA_DEVICE_MAX_CONNECTIONS=1
 export NVTE_ALLOW_NONDETERMINISTIC_ALGO=0
 export OMP_NUM_THREADS=1
 
+# TODO: set mount & docker
 MOUNT='/home/haoyuan/workspace:/home/haoyuan/workspace'
 MOUNT+=',/home/jqi/workspace:/home/jqi/workspace,/lustre/raplab/client/jqi/workspace:/lustre/raplab/client/jqi/workspace,/lustre/raplab/client/xueh/workspace:/lustre/raplab/client/xueh/workspace,/lustre/raplab/client/haoyuan/workspace:/lustre/raplab/client/haoyuan/workspace'
 IMAGE=/lustre/raplab/client/jqi/workspace/nemo.25.07.sqsh
@@ -30,6 +32,7 @@ IMAGE=/lustre/raplab/client/jqi/workspace/nemo.25.07.sqsh
 echo Image: $IMAGE
 echo $MOUNT 
 
+# TODO: set work dir
 WORKDIR=/home/jqi/workspace/work/training-lab/qwen-vl/nemo/test-llm
 EXE=${WORKDIR}/pretraining.py
 
@@ -46,6 +49,7 @@ mkdir -p ${LOGS_DIR}
 # GBS=1
 # MAX_SEQ=4096
 FP8="--fp8"  # control fp8 or bf16
+RECIPE="--recipe qwen2_7b"
 PROFILE_OUT=llama.3B.H20.tp2
 NSYS="nsys profile -s none \
       -o ${PROFILE_OUT} \
@@ -60,7 +64,7 @@ run_cmd=" \
     export MASTER_PORT=${MASTER_PORT}; \
     export HUGGINGFACE_HUB_CACHE=/root/.cache/huggingface/hub; \
     export HF_HOME=/home/jqi/workspace/hf_home/hub/; \
-    NVTE=1 NVTE_DEBUG_LEVEL=2 python ${EXE} ${FP8}"
+    NVTE=1 NVTE_DEBUG_LEVEL=2 python ${EXE} ${FP8} ${RECIPE}"
 echo ${run_cmd}
 
 srun -l \

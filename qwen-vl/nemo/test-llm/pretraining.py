@@ -149,9 +149,9 @@ def main():
     pretrain_recipe = getattr(llm, args.recipe).pretrain_recipe
     pretrain = partial(pretrain_recipe)(
         name=exp_name,
-        num_gpus_per_node=1,
         dir=None)
        #dir="/nemo_run/checkpoints")
+    #   num_gpus_per_node=2,
 
     # Overwrite the dataloader in the recipe to use your custom dataloader.
     # dataloader = set_your_custom_dataloader
@@ -160,12 +160,12 @@ def main():
 
     pretrain.log.ckpt.save_top_k = -1
 
-    pretrain.data.seq_length = 2048
+    pretrain.data.seq_length = 4096
     pretrain.data.global_batch_size = 16
     pretrain.data.micro_batch_size = 1
     pretrain.trainer.val_check_interval = 400
     pretrain.trainer.num_nodes = 1
-    pretrain.trainer.devices = 1
+    pretrain.trainer.devices = 2
     pretrain.trainer.max_steps = 32
     if args.fp8:
       pretrain.trainer.plugins = bf16_with_fp8_mixed()

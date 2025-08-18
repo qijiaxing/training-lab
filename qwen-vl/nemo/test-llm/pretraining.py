@@ -50,76 +50,25 @@ def get_parser():
         default=False,
     )
     parser.add_argument(
-        "--slurm",
-        action="store_true",
-        help="Run on slurm using run.SlurmExecutor",
-        default=False,
-    )
-    parser.add_argument(
         "--fp8",
         action="store_true",
         help="Enable fp8",
         default=False,
     )
+    parser.add_argument(
+        "--devices",
+        type=int,
+        default=8,
+        help="Number of devices",
+    )
+    parser.add_argument(
+        "--tensor_parallel_size",
+        type=int,
+        default=4,
+        help="Tensor Parallel Size"
+    )
     return parser
 
-
-def slurm_executor(
-    user: str,
-    host: str,
-    remote_job_dir: str,
-    account: str,
-    partition: str,
-    nodes: int,
-    devices: int,
-    time: str = "01:00:00",
-    custom_mounts: Optional[list[str]] = None,
-    custom_env_vars: Optional[dict[str, str]] = None,
-    container_image: str = "nvcr.io/nvidia/nemo:dev",
-    retries: int = 0,
-) -> run.SlurmExecutor:
-    if not (user and host and remote_job_dir and account and partition and nodes and devices):
-        raise RuntimeError(
-            "Please set user, host, remote_job_dir, account, partition, nodes and devices args for using this ",
-            "function.",
-        )
-
-    mounts = []
-    if custom_mounts:
-        mounts.extend(custom_mounts)
-
-    env_vars = {
-        "TRANSFORMERS_OFFLINE": "1",  # Enable online downloads from HuggingFace
-        "TORCH_NCCL_AVOID_RECORD_STREAMS": "1",  # Disable caching NCCL communication buffer memory
-        "NCCL_NVLS_ENABLE": "0",  # Disable NVLink SHARP to save memory
-    }
-    if custom_env_vars:
-        env_vars |= custom_env_vars
-
-    executor = run.SlurmExecutor(
-        account=account,
-        partition=partition,
-        tunnel=run.SSHTunnel(
-            user=user,
-            host=host,
-            job_dir=remote_job_dir,
-        ),
-        nodes=nodes,
-        ntasks_per_node=devices,
-        gpus_per_node=devices,
-        mem="0",
-        exclusive=True,
-        gres="gpu:8",
-        packager=run.GitArchivePackager(),
-    )
-
-    executor.container_image = container_image
-    executor.container_mounts = mounts
-    executor.env_vars = env_vars
-    executor.retries = retries
-    executor.time = time
-
-    return executor
 
 
 def local_executor_torchrun(nodes: int = 1, devices: int = 2) -> run.LocalExecutor:
@@ -149,9 +98,9 @@ def main():
     pretrain_recipe = getattr(llm, args.recipe).pretrain_recipe
     pretrain = partial(pretrain_recipe)(
         name=exp_name,
+        tensor_parallelism=args.tensor_parallel_size,
         dir=None)
        #dir="/nemo_run/checkpoints")
-    #   num_gpus_per_node=2,
 
     # Overwrite the dataloader in the recipe to use your custom dataloader.
     # dataloader = set_your_custom_dataloader
@@ -165,7 +114,7 @@ def main():
     pretrain.data.micro_batch_size = 1
     pretrain.trainer.val_check_interval = 400
     pretrain.trainer.num_nodes = 1
-    pretrain.trainer.devices = 2
+    pretrain.trainer.devices = args.devices
     pretrain.trainer.max_steps = 32
     if args.fp8:
       pretrain.trainer.plugins = bf16_with_fp8_mixed()
@@ -184,23 +133,9 @@ def main():
     )
 
     executor: run.Executor
-
-    if args.slurm:
-        # TODO: Set your custom parameters for the Slurm Executor.
-        executor = slurm_executor(
-            user="",
-            host="",
-            remote_job_dir="",
-            account="",
-            partition="",
-            nodes=pretrain.trainer.num_nodes,
-            devices=pretrain.trainer.devices,
-            custom_mounts=[],
-        )
-    else:
-        executor = local_executor_torchrun(
-            nodes=pretrain.trainer.num_nodes,
-            devices=pretrain.trainer.devices)
+    executor = local_executor_torchrun(
+        nodes=pretrain.trainer.num_nodes,
+        devices=pretrain.trainer.devices)
 
     with run.Experiment(f"{exp_name}{args.tag}") as exp:
         for i in range(1):
